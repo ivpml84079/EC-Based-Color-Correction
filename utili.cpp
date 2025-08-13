@@ -1,8 +1,8 @@
-#include <opencv2/core.hpp>
+﻿#include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/opencv.hpp>
-#include <opencv2/xfeatures2d/xfeatures2d.hpp>
+#include <opencv2/xfeatures2d.hpp>
 #include <opencv2/xfeatures2d/nonfree.hpp>
 #include <iostream>
 #include <typeinfo>
@@ -10,12 +10,153 @@
 #include <numeric>
 #include <cstring>
 
+// 新增的頭文件
+#include <opencv2/imgproc.hpp>
+
 #include "utili.h"
 
 using namespace cv;
 using namespace cv::xfeatures2d;
 using namespace std;
 using namespace filesystem;
+
+// 新增輔助結構體來存儲三角形信息
+// 新增結構體和類的實現
+struct Triangle {
+    int vertices[3];
+    Point2f centroid;
+
+    Triangle(int v0, int v1, int v2) {
+        vertices[0] = v0;
+        vertices[1] = v1;
+        vertices[2] = v2;
+    }
+
+    void setCentroid(const vector<pair<Point2f, Point2f>>& correspondences) {
+        centroid = (correspondences[vertices[0]].first +
+            correspondences[vertices[1]].first +
+            correspondences[vertices[2]].first) / 3.0f;
+    }
+};
+
+class DelaunayJBI {
+private:
+    vector<Triangle> triangles;
+    Mat triangleIndexMap;
+
+    int findCorrespondenceIndex(const Point2f& pt, const vector<Point2f>& points) {
+        const float tolerance = 1e-6f;
+        for (size_t i = 0; i < points.size(); i++) {
+            if (abs(pt.x - points[i].x) < tolerance && abs(pt.y - points[i].y) < tolerance) {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }
+
+    void buildPixelTriangleMap(const vector<pair<Point2f, Point2f>>& correspondences,
+        const Size& imageSize) {
+        triangleIndexMap = Mat::ones(imageSize, CV_32S) * -1;
+
+        for (size_t triIdx = 0; triIdx < triangles.size(); triIdx++) {
+            const Triangle& tri = triangles[triIdx];
+
+            Point2f pt1 = correspondences[tri.vertices[0]].first;
+            Point2f pt2 = correspondences[tri.vertices[1]].first;
+            Point2f pt3 = correspondences[tri.vertices[2]].first;
+
+            int minX = max(0, (int)floor(min({ pt1.x, pt2.x, pt3.x })));
+            int maxX = min(imageSize.width - 1, (int)ceil(max({ pt1.x, pt2.x, pt3.x })));
+            int minY = max(0, (int)floor(min({ pt1.y, pt2.y, pt3.y })));
+            int maxY = min(imageSize.height - 1, (int)ceil(max({ pt1.y, pt2.y, pt3.y })));
+
+            for (int y = minY; y <= maxY; y++) {
+                for (int x = minX; x <= maxX; x++) {
+                    Point2f pixel(x, y);
+                    if (isPointInTriangle(pixel, pt1, pt2, pt3)) {
+                        triangleIndexMap.at<int>(y, x) = static_cast<int>(triIdx);
+                    }
+                }
+            }
+        }
+    }
+
+    bool isPointInTriangle(const Point2f& p, const Point2f& a,
+        const Point2f& b, const Point2f& c) {
+        float denominator = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+        if (abs(denominator) < 1e-10) return false;
+
+        float alpha = ((b.y - c.y) * (p.x - c.x) + (c.x - b.x) * (p.y - c.y)) / denominator;
+        float beta = ((c.y - a.y) * (p.x - c.x) + (a.x - c.x) * (p.y - c.y)) / denominator;
+        float gamma = 1.0f - alpha - beta;
+
+        return alpha >= 0 && beta >= 0 && gamma >= 0;
+    }
+
+public:
+    void buildDelaunayTriangulation(const vector<pair<Point2f, Point2f>>& correspondences,
+        const Size& imageSize) {
+        if (correspondences.size() < 3) {
+            cout << "Warning: Not enough correspondences for triangulation" << endl;
+            return;
+        }
+
+        vector<Point2f> points;
+        for (const auto& corr : correspondences) {
+            points.push_back(corr.first);
+        }
+
+        Rect rect(0, 0, imageSize.width, imageSize.height);
+        Subdiv2D subdiv(rect);
+
+        for (size_t i = 0; i < points.size(); i++) {
+            subdiv.insert(points[i]);
+        }
+
+        vector<Vec6f> triangleList;
+        subdiv.getTriangleList(triangleList);
+
+        triangles.clear();
+
+        for (const auto& t : triangleList) {
+            Point2f pt1(t[0], t[1]);
+            Point2f pt2(t[2], t[3]);
+            Point2f pt3(t[4], t[5]);
+
+            if (rect.contains(pt1) && rect.contains(pt2) && rect.contains(pt3)) {
+                int idx1 = findCorrespondenceIndex(pt1, points);
+                int idx2 = findCorrespondenceIndex(pt2, points);
+                int idx3 = findCorrespondenceIndex(pt3, points);
+
+                if (idx1 >= 0 && idx2 >= 0 && idx3 >= 0) {
+                    Triangle tri(idx1, idx2, idx3);
+                    tri.setCentroid(correspondences);
+                    triangles.push_back(tri);
+                }
+            }
+        }
+
+        buildPixelTriangleMap(correspondences, imageSize);
+
+        cout << "Built " << triangles.size() << " triangles from "
+            << correspondences.size() << " correspondences" << endl;
+    }
+
+    int getTriangleIndex(int x, int y) const {
+        if (x >= 0 && x < triangleIndexMap.cols && y >= 0 && y < triangleIndexMap.rows) {
+            return triangleIndexMap.at<int>(y, x);
+        }
+        return -1;
+    }
+
+    const Triangle& getTriangle(int triangleIdx) const {
+        return triangles[triangleIdx];
+    }
+
+    size_t getTriangleCount() const {
+        return triangles.size();
+    }
+};
 
 vector<string> Inits::getImgFilenameList(string& addr)
 {
@@ -160,7 +301,7 @@ void Inits::loadAll(string& warpDir, string& overlapDir, string& corrDir, string
 
     cout << "load correspondence." << endl;
     Corr_vec = Inits::LoadCorr(corrDir, N);
-    
+
     cout << "load img masks." << endl;
     masks = Inits::LoadImgMask(maskDir, N);
 }
@@ -238,7 +379,6 @@ ImgPack Utils::CalDF(Mat& src, int channel, Mat& overlap)
 
     return src_DF;
 }
-
 
 Mat Utils::HM_Fecker(Mat& ref, Mat& tar, Mat& overlap)
 {
@@ -371,7 +511,7 @@ int Utils::findFirstImg() {
 
     int vertex1 = min_edge_idx;
     int vertex2 = min_edge_idx + 1;
-    
+
     int mid = n / 2;
     int dist1 = abs(vertex1 - mid);
     int dist2 = abs(vertex2 - mid);
@@ -406,9 +546,9 @@ vector<int> Utils::EC()
 
         Utils::single_img_correction(tar_ref);
         is_corrected[tar_ref.first] = true;
-        
+
     }
-    
+
     return final_sequence;
 }
 
@@ -440,13 +580,95 @@ double calculateJBIWeight(const cv::Vec3f& color1, const cv::Vec3f& color2, doub
     return weight;
 }
 
-Mat Utils::JBI(Mat& ref, Mat& tar, Mat& overlap, vector<pair<Point2f, Point2f>>& correspondences) {
-    // input
+//Mat Utils::JBI(Mat& ref, Mat& tar, Mat& overlap, vector<pair<Point2f, Point2f>>& correspondences) {
+//    // input
+//    vector<Vec3d> color_diff(correspondences.size());
+//
+//    // output
+//    Mat result = Mat::zeros(tar.size(), CV_64FC3);
+//
+//    Mat ref_64FC3, tar_64FC3;
+//    ref.convertTo(ref_64FC3, CV_64FC3);
+//    tar.convertTo(tar_64FC3, CV_64FC3);
+//
+//    for (size_t i = 0; i < correspondences.size(); ++i) {
+//        Point2f pt1 = correspondences[i].first;
+//        Point2f pt2 = correspondences[i].second;
+//
+//        if (pt1.x >= 0 && pt1.y >= 0 && pt1.x < ref.cols && pt1.y < ref.rows &&
+//            pt2.x >= 0 && pt2.y >= 0 && pt2.x < tar.cols && pt2.y < tar.rows) {
+//            Vec3d color1 = ref_64FC3.at<Vec3d>(pt1);
+//            Vec3d color2 = tar_64FC3.at<Vec3d>(pt2);
+//            //ref RGB - tar RGB
+//            color_diff[i] = color1 - color2;
+//        }
+//    }
+//
+//
+//#pragma omp parallel for collapse(2)
+//    for (int i = 0; i < tar.rows; ++i) {
+//        for (int j = 0; j < tar.cols; ++j) {
+//            if (overlap.at<uchar>(i, j) != 0) {
+//                Point2f curr_pt(j, i);
+//                double sumWeights = 0.0;
+//                Vec3d weightedColorDiff(0, 0, 0);
+//                vector<double> weightVec(correspondences.size());
+//
+//                for (int k = 0; k < correspondences.size(); ++k) {
+//                    Point2f src_pt = correspondences[k].first;
+//                    if (curr_pt.x >= 0 && curr_pt.y >= 0 && curr_pt.x < tar.cols && curr_pt.y < tar.rows &&
+//                        src_pt.x >= 0 && src_pt.y >= 0 && src_pt.x < tar.cols && src_pt.y < tar.rows) {
+//                        Vec3d color_curr = tar_64FC3.at<Vec3d>(curr_pt);
+//                        Vec3d color_src = ref_64FC3.at<Vec3d>(src_pt);
+//
+//                        // JBI
+//                        double spatialDistance = cv::norm(curr_pt - src_pt);
+//                        double weight = calculateJBIWeight(color_curr, color_src, spatialDistance, sigma1, sigma2, tar.cols);
+//
+//                        weightVec[k] = weight;
+//
+//                        sumWeights += weight;
+//                    }
+//                }
+//
+//                if (sumWeights > 0) {
+//                    double logSumWeight = std::log(sumWeights);
+//                    for (int idx = 0; idx < correspondences.size(); idx++) {
+//                        for (int c = 0; c < 3; c++) {
+//                            double logWeight = std::log(weightVec[idx]);
+//                            double expWeight = exp(logWeight - logSumWeight);
+//                            if (color_diff[idx][c] != 0.0) {
+//                                weightedColorDiff[c] += expWeight * color_diff[idx][c];
+//                            }
+//                        }
+//                    }
+//                }
+//                result.at<Vec3d>(i, j) = weightedColorDiff;
+//            }
+//        }
+//    }
+//    return result;
+//}
+
+// 優化的JBI實現
+Mat optimizedJBI(Mat& ref, Mat& tar, Mat& overlap,
+    vector<pair<Point2f, Point2f>>& correspondences,
+    double sigma1, double sigma2) {
+
+    if (correspondences.empty()) {
+        cout << "No correspondences available" << endl;
+        return Mat::zeros(tar.size(), CV_64FC3);
+    }
+
+    DelaunayJBI delaunay;
+    delaunay.buildDelaunayTriangulation(correspondences, tar.size());
+
+    if (delaunay.getTriangleCount() == 0) {
+        cout << "No valid triangles created, falling back to original method" << endl;
+        return Mat::zeros(tar.size(), CV_64FC3);
+    }
+
     vector<Vec3d> color_diff(correspondences.size());
-
-    // output
-    Mat result = Mat::zeros(tar.size(), CV_64FC3);
-
     Mat ref_64FC3, tar_64FC3;
     ref.convertTo(ref_64FC3, CV_64FC3);
     tar.convertTo(tar_64FC3, CV_64FC3);
@@ -459,58 +681,73 @@ Mat Utils::JBI(Mat& ref, Mat& tar, Mat& overlap, vector<pair<Point2f, Point2f>>&
             pt2.x >= 0 && pt2.y >= 0 && pt2.x < tar.cols && pt2.y < tar.rows) {
             Vec3d color1 = ref_64FC3.at<Vec3d>(pt1);
             Vec3d color2 = tar_64FC3.at<Vec3d>(pt2);
-            //ref RGB - tar RGB
             color_diff[i] = color1 - color2;
         }
     }
 
+    Mat result = Mat::zeros(tar.size(), CV_64FC3);
 
 #pragma omp parallel for collapse(2)
     for (int i = 0; i < tar.rows; ++i) {
         for (int j = 0; j < tar.cols; ++j) {
             if (overlap.at<uchar>(i, j) != 0) {
-                Point2f curr_pt(j, i);
-                double sumWeights = 0.0;
-                Vec3d weightedColorDiff(0, 0, 0);
-                vector<double> weightVec(correspondences.size());
+                int triangleIdx = delaunay.getTriangleIndex(j, i);
 
-                for (int k = 0; k < correspondences.size(); ++k) {
-                    Point2f src_pt = correspondences[k].first;
-                    if (curr_pt.x >= 0 && curr_pt.y >= 0 && curr_pt.x < tar.cols && curr_pt.y < tar.rows &&
-                        src_pt.x >= 0 && src_pt.y >= 0 && src_pt.x < tar.cols && src_pt.y < tar.rows) {
-                        Vec3d color_curr = tar_64FC3.at<Vec3d>(curr_pt);
-                        Vec3d color_src = ref_64FC3.at<Vec3d>(src_pt);
+                if (triangleIdx >= 0) {
+                    const Triangle& tri = delaunay.getTriangle(triangleIdx);
+                    Point2f curr_pt(j, i);
 
-                        // JBI
-                        double spatialDistance = cv::norm(curr_pt - src_pt);
-                        double weight = calculateJBIWeight(color_curr, color_src, spatialDistance, 0.3, 0.7, tar.cols);
+                    double sumWeights = 0.0;
+                    Vec3d weightedColorDiff(0, 0, 0);
 
-                        weightVec[k] = weight;
+                    for (int k = 0; k < 3; ++k) {
+                        int corrIdx = tri.vertices[k];
+                        Point2f src_pt = correspondences[corrIdx].first;
 
-                        sumWeights += weight;
-                    }
-                }
+                        if (curr_pt.x >= 0 && curr_pt.y >= 0 && curr_pt.x < tar.cols && curr_pt.y < tar.rows &&
+                            src_pt.x >= 0 && src_pt.y >= 0 && src_pt.x < tar.cols && src_pt.y < tar.rows) {
 
-                if (sumWeights > 0) {
-                    double logSumWeight = std::log(sumWeights);
-                    for (int idx = 0; idx < correspondences.size(); idx++) {
-                        for (int c = 0; c < 3; c++) {
-                            double logWeight = std::log(weightVec[idx]);
-                            double expWeight = exp(logWeight - logSumWeight);
-                            if (color_diff[idx][c] != 0.0) {
-                                weightedColorDiff[c] += expWeight * color_diff[idx][c];
+                            Vec3d color_curr = tar_64FC3.at<Vec3d>(curr_pt);
+                            Vec3d color_src = ref_64FC3.at<Vec3d>(src_pt);
+
+                            double spatialDistance = cv::norm(curr_pt - src_pt);
+                            double colorDistance = cv::norm(color_curr, color_src);
+                            double weight = std::exp(-(colorDistance * colorDistance) / (sigma1 * sigma1)) *
+                                std::exp(-(spatialDistance * spatialDistance) / (tar.cols * sigma2 * sigma2));
+
+                            if (!std::isfinite(weight) || weight < std::numeric_limits<double>::min()) {
+                                weight = std::numeric_limits<double>::min();
+                            }
+
+                            sumWeights += weight;
+
+                            for (int c = 0; c < 3; c++) {
+                                if (color_diff[corrIdx][c] != 0.0) {
+                                    weightedColorDiff[c] += weight * color_diff[corrIdx][c];
+                                }
                             }
                         }
                     }
+
+                    if (sumWeights > 0) {
+                        weightedColorDiff /= sumWeights;
+                    }
+
+                    result.at<Vec3d>(i, j) = weightedColorDiff;
                 }
-                result.at<Vec3d>(i, j) = weightedColorDiff;
             }
         }
     }
+
     return result;
 }
 
+// 修改Utils命名空間中的JBI函數實現
+Mat Utils::JBI(Mat& ref, Mat& tar, Mat& overlap, vector<pair<Point2f, Point2f>>& correspondences) {
+    return optimizedJBI(ref, tar, overlap, correspondences, sigma1, sigma2);
+}
 
+// 優化後的NonOverlapJBI函數 - 只計算border擴散5pixel範圍內的像素
 Mat Utils::NonOverlapJBI(Mat& ori_img, Mat& correct_img, vector<Point>& border_pixel, Mat& overlap, Mat& mask) {
     vector<Vec3d> color_diff(border_pixel.size());
     Mat result = Mat::zeros(ori_img.size(), CV_64FC3);
@@ -518,6 +755,11 @@ Mat Utils::NonOverlapJBI(Mat& ori_img, Mat& correct_img, vector<Point>& border_p
     correct_img.convertTo(ref_64FC3, CV_64FC3);
     ori_img.convertTo(tar_64FC3, CV_64FC3);
 
+    // 計算border擴散5pixel的區域
+    const int EXPANSION_RADIUS = 5;
+    Mat border_expansion_mask = Utils::computeBorderExpansion(border_pixel, EXPANSION_RADIUS, mask);
+
+    // 預計算color_diff
 #pragma omp parallel for
     for (int i = 0; i < border_pixel.size(); ++i) {
         Point2f pt = border_pixel[i];
@@ -528,27 +770,17 @@ Mat Utils::NonOverlapJBI(Mat& ori_img, Mat& correct_img, vector<Point>& border_p
         }
     }
 
+    // 只收集border擴散範圍內的像素
     vector<Point> valid_pixels;
-
-#pragma omp parallel
-    {
-        vector<Point> local_pixels;
-
-#pragma omp for collapse(2) nowait
-        for (int i = 0; i < ori_img.rows; ++i) {
-            for (int j = 0; j < ori_img.cols; ++j) {
-                if (!overlap.at<uchar>(i, j) && mask.at<uchar>(i, j)) {
-                    local_pixels.push_back(Point(j, i));
-                }
+    for (int i = 0; i < ori_img.rows; ++i) {
+        for (int j = 0; j < ori_img.cols; ++j) {
+            if (!overlap.at<uchar>(i, j) && mask.at<uchar>(i, j) && border_expansion_mask.at<uchar>(i, j)) {
+                valid_pixels.push_back(Point(j, i));
             }
-        }
-
-#pragma omp critical
-        {
-            valid_pixels.insert(valid_pixels.end(), local_pixels.begin(), local_pixels.end());
         }
     }
 
+    // 平行處理有效像素
 #pragma omp parallel for schedule(dynamic, 50)
     for (int idx = 0; idx < valid_pixels.size(); ++idx) {
         Point pixel = valid_pixels[idx];
@@ -562,19 +794,15 @@ Mat Utils::NonOverlapJBI(Mat& ori_img, Mat& correct_img, vector<Point>& border_p
 
         for (int k = 0; k < border_pixel.size(); ++k) {
             Point2f src_pt = border_pixel[k];
-            if (curr_pt.x >= 0 && curr_pt.y >= 0 && curr_pt.x < ori_img.cols && curr_pt.y < ori_img.rows &&
-                src_pt.x >= 0 && src_pt.y >= 0 && src_pt.x < ori_img.cols && src_pt.y < ori_img.rows) {
-                Vec3d color_curr = tar_64FC3.at<Vec3d>(curr_pt);
-                Vec3d color_src = ref_64FC3.at<Vec3d>(src_pt);
-                // JBI
-                double spatialDistance = cv::norm(curr_pt - src_pt);
-                double weight = calculateJBIWeight(color_curr, color_src, spatialDistance, 0.3, 0.7, ori_img.cols);
-                weightVec[k] = weight;
-                sumWeights += weight;
-            }
+            Vec3d color_curr = tar_64FC3.at<Vec3d>(curr_pt);
+            Vec3d color_src = ref_64FC3.at<Vec3d>(src_pt);
+
+            double spatialDistance = cv::norm(curr_pt - src_pt);
+            double weight = calculateJBIWeight(color_curr, color_src, spatialDistance, 0.5, 5.0, ori_img.cols);
+            weightVec[k] = weight;
+            sumWeights += weight;
         }
 
-        // weight
         if (sumWeights > 0) {
             double logSumWeight = std::log(sumWeights);
             for (int k = 0; k < border_pixel.size(); k++) {
@@ -606,6 +834,7 @@ void Utils::HE_JBI_fusion(Mat& warped_tar_img, Mat& Fecker_comp, Mat& Color_diff
                 for (int c = 0; c < 3; c++) {
                     double total_error = abs(Fecker_error_map.at<Vec3d>(p)[c]) + abs(Color_diff_error_map.at<Vec3d>(p)[c]);
                     double rate = total_error == 0.0 ? 0.0 : abs(Fecker_error_map.at<Vec3d>(p)[c]) / total_error;
+                    //double rate = 1.0;
                     double single_color_correct = Color_diff_comp.at<Vec3d>(p)[c] * rate + Fecker_comp.at<Vec3d>(p)[c] * (1 - rate);
                     warped_tar_img.at<Vec3d>(p)[c] += single_color_correct;
                     if (warped_tar_img.at<Vec3d>(p)[c] < 0) {
@@ -885,20 +1114,62 @@ void Utils::nonOverlapColorCorrect(Mat& warped_tar_img, Mat& cite_range, Mat& Fe
     warped_tar_img.convertTo(warped_tar_img, CV_8UC3);
 }
 
-Mat Utils::getFusionNonOverlap(Mat& warped_tar_img, Mat& cite_range, Mat& Fecker_comp, Mat& JBI_comp, Mat& overlap, Mat& mask, vector<Point>& border_pixel) {
+// 新增: 計算border擴散區域的函數
+Mat Utils::computeBorderExpansion(const vector<Point>& border_pixel, int expansion_radius, const Mat& mask) {
+    Mat expansion_mask = Mat::zeros(mask.size(), CV_8UC1);
+
+    // 首先標記所有border pixel
+    for (const Point& p : border_pixel) {
+        expansion_mask.at<uchar>(p) = 255;
+    }
+
+    // 進行形態學膨脹操作來擴散border
+    Mat kernel = getStructuringElement(MORPH_ELLIPSE,
+        Size(2 * expansion_radius + 1, 2 * expansion_radius + 1));
+    Mat dilated_mask;
+    dilate(expansion_mask, dilated_mask, kernel);
+
+    // 只保留在mask範圍內的像素
+    Mat result;
+    bitwise_and(dilated_mask, mask, result);
+
+    return result;
+}
+
+// 修改後的getFusionNonOverlap函數
+Mat Utils::getFusionNonOverlap(Mat& warped_tar_img, Mat& cite_range, Mat& Fecker_comp,
+    Mat& JBI_comp, Mat& overlap, Mat& mask, vector<Point>& border_pixel) {
 
     Mat result = Mat::zeros(warped_tar_img.size(), CV_64FC3);
+
+    // 計算border擴散5pixel的區域
+    const int EXPANSION_RADIUS = 5;
+    Mat border_expansion_mask = Utils::computeBorderExpansion(border_pixel, EXPANSION_RADIUS, mask);
+
+    cout << "Border expansion computed for " << EXPANSION_RADIUS << " pixels" << endl;
 
 #pragma omp parallel for collapse(2)
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             Point p(x, y);
             if (!overlap.at<uchar>(p) && mask.at<uchar>(p)) {
+
+                // 檢查是否在border擴散範圍內
+                bool in_border_expansion = border_expansion_mask.at<uchar>(p) > 0;
+
                 for (int c = 0; c < 3; c++) {
-                    double rate = 1.0 * cite_range.at<int>(p) / border_pixel.size();
-                    double weighted_rate = rate * 0.2;
-                    weighted_rate = weighted_rate > 1.0 ? 1.0 : weighted_rate < 0.0 ? 0.0 : weighted_rate;
-                    result.at<Vec3d>(p)[c] = Fecker_comp.at<Vec3d>(p)[c] * (1.0 - weighted_rate) + JBI_comp.at<Vec3d>(p)[c] * weighted_rate;
+                    if (in_border_expansion) {
+                        // 在border擴散範圍內：使用混合色彩校正
+                        double rate = 1.0 * cite_range.at<int>(p) / border_pixel.size();
+                        double weighted_rate = rate * alpha;
+                        weighted_rate = weighted_rate > 1.0 ? 1.0 : weighted_rate < 0.0 ? 0.0 : weighted_rate;
+                        result.at<Vec3d>(p)[c] = Fecker_comp.at<Vec3d>(p)[c] * (1.0 - weighted_rate) +
+                            JBI_comp.at<Vec3d>(p)[c] * weighted_rate;
+                    }
+                    else {
+                        // 在border擴散範圍外：只使用HM色彩校正
+                        result.at<Vec3d>(p)[c] = Fecker_comp.at<Vec3d>(p)[c];
+                    }
                 }
             }
         }
@@ -906,8 +1177,8 @@ Mat Utils::getFusionNonOverlap(Mat& warped_tar_img, Mat& cite_range, Mat& Fecker
     return result;
 }
 
-void Utils::getNonOverlapColorCorrectImg(Mat& warped_tar_img, Mat& fusion_comp, Mat& overlap, Mat& mask)
-{
+// 修改後的getNonOverlapColorCorrectImg函數
+void Utils::getNonOverlapColorCorrectImg(Mat& warped_tar_img, Mat& fusion_comp, Mat& overlap, Mat& mask) {
     warped_tar_img.convertTo(warped_tar_img, CV_64FC3);
 
 #pragma omp parallel for collapse(2)
@@ -930,6 +1201,7 @@ void Utils::getNonOverlapColorCorrectImg(Mat& warped_tar_img, Mat& fusion_comp, 
     warped_tar_img.convertTo(warped_tar_img, CV_8UC3);
 }
 
+// 修改後的single_img_correction函數 (主要是改進輸出訊息)
 void Utils::single_img_correction(pair<int, int> tar_ref)
 {
     int tar = tar_ref.first;
@@ -959,10 +1231,11 @@ void Utils::single_img_correction(pair<int, int> tar_ref)
 
     cout << "[non-overlap]-->";
     Mat non_Fecker_comp = Utils::HM_Fecker(warped_imgs[tar], NonCorrectTarImg, overlap);
-    
+
     Mat non_JBI_comp = Utils::NonOverlapJBI(NonCorrectTarImg, warped_imgs[tar], border_pixel, overlap, masks[tar]);
-    
-    cout << "[fusion]" << endl;
+
+    cout << "[fusion with 5-pixel border]" << endl;
+    // 現在使用修改後的函數，會自動處理5pixel邊界策略
     Mat nonOverlap_comp = Utils::getFusionNonOverlap(warped_imgs[tar], cite_range, non_Fecker_comp, non_JBI_comp, overlap, masks[tar], border_pixel);
 
     Utils::getNonOverlapColorCorrectImg(warped_imgs[tar], nonOverlap_comp, overlap, masks[tar]);

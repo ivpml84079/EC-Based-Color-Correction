@@ -24,7 +24,8 @@ extern map<pair<int, int>, vector<pair<Point2f, Point2f>>> Corr_vec;
 // super parameters
 extern int height, width;
 extern bool ignore_non_corrected, pano;
-
+extern float sigma1, sigma2;
+extern float alpha;
 
 struct ImgPack
 {
@@ -40,6 +41,9 @@ namespace Utils
     // boarder wavefront
     Mat computeWavefront(Mat& overlap);
 
+    // 新增: border擴散計算函數
+    Mat computeBorderExpansion(const vector<Point>& border_pixel, int expansion_radius, const Mat& mask);
+
     //Fecker func
     ImgPack CalDF(Mat& src, int channel, Mat& overlap);
     Mat HM_Fecker(Mat& ref, Mat& tar, Mat& overlap);
@@ -53,7 +57,6 @@ namespace Utils
     //Corr based func
     Mat JBI(Mat& ref, Mat& tar, Mat& overlap, vector<pair<Point2f, Point2f>>& correspondences);
 
-    
     Mat NonOverlapJBI(Mat& ori_img, Mat& correct_img, vector<Point>& border_pixel, Mat& overlap, Mat& mask);
     void nonOverlapColorCorrect(Mat& warped_tar_img, Mat& cite_range, Mat& Fecker_comp, Mat& JBI_comp, Mat& overlap, Mat& mask, vector<Point>& border_pixel);
     Mat getFusionNonOverlap(Mat& warped_tar_img, Mat& cite_range, Mat& Fecker_comp, Mat& JBI_comp, Mat& overlap, Mat& mask, vector<Point>& border_pixel);
@@ -85,7 +88,7 @@ namespace Inits
     void loadAll(string& warpDir, string& overlapDir, string& corrDir, string& maskDir);
 }
 
-namespace Tools 
+namespace Tools
 {
     Mat createResult(const std::vector<cv::Mat>& warped_imgs, const vector<cv::Mat>& masks);
 }
